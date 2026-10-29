@@ -15,6 +15,8 @@ import (
 
 var ctx = context.Background()
 
+func runNow(store.ClaimedRun) (bool, time.Time, error) { return true, time.Time{}, nil }
+
 func addJob(t *testing.T, db *store.Store, tenant uuid.UUID, at time.Time) domain.Job {
 	t.Helper()
 	id := uuid.New()
@@ -64,6 +66,24 @@ func TestConcurrentLeaseAcquisitionIsExclusive(t *testing.T) {
 	wg.Wait()
 	if len(owners) != domain.ShardCount {
 		t.Fatalf("want all %d shards owned, got %d", domain.ShardCount, len(owners))
+	}
+}
+
+// If the next occurrence weren't written in the claim tx, a crash right after
+// claiming would end the schedule for good.
+func TestClaimStoresNextOccurrence(t *testing.T) {
+	url := testdb.New(t)
+	db := store.New(testdb.Pool(t, url, nil))
+	job := addJob(t, db, uuid.New(), time.Now().Add(-time.Second))
+	ownAllShards(t, db, "node-a")
+	next := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	plan := func(store.ClaimedRun) (bool, time.Time, error) { return true, next, nil }
+	if _, _, _, err := db.Claim(ctx, "node-a", 10, 10, plan); err != nil {
+		t.Fatal(err)
+	}
+	at, ok, err := db.NextScheduled(ctx, job.ID)
+	if err != nil || !ok || !at.Equal(next) {
+		t.Fatalf("next occurrence: want %s, got %s (%v, %v)", next, at, ok, err)
 	}
 }
 
