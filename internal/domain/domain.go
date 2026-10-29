@@ -3,9 +3,13 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
+
 	"github.com/google/uuid"
 )
 
@@ -75,6 +79,26 @@ func ShardFor(id uuid.UUID) int {
 	return int(hash % ShardCount)
 }
 
+// OccurrenceKey is derived from job + scheduled time, so any node computing
+// it for the same occurrence gets the same key.
+func OccurrenceKey(jobID uuid.UUID, scheduledAt time.Time) string {
+	return digest(jobID.String(), scheduledAt.UTC().Format(time.RFC3339Nano))
+}
+
+// ManualKey lets a client retry a trigger request without starting a second run.
+func ManualKey(jobID uuid.UUID, clientKey string) string {
+	return digest(jobID.String(), "manual", clientKey)
+}
+
+func digest(parts ...string) string {
+	h := sha256.New()
+	for _, p := range parts {
+		h.Write([]byte(p))
+		h.Write([]byte{0}) // separator, so ("ab","c") != ("a","bc")
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 var (
 	ErrNotFound = errors.New("not found")
 	// ErrStaleLease: we lost the shard while the run was in flight, so the
@@ -85,3 +109,8 @@ var (
 // ValidationError is the only error whose message goes back to the client.
 type ValidationError struct{ Message string }
 
+func (e *ValidationError) Error() string { return e.Message }
+
+func Invalid(format string, args ...any) error {
+	return &ValidationError{Message: fmt.Sprintf(format, args...)}
+}
