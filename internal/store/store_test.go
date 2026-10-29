@@ -69,6 +69,46 @@ func TestConcurrentLeaseAcquisitionIsExclusive(t *testing.T) {
 	}
 }
 
+func TestClaimIsFairAndRespectsCapAndPause(t *testing.T) {
+	url := testdb.New(t)
+	db := store.New(testdb.Pool(t, url, nil))
+	noisy, quiet, paused := uuid.New(), uuid.New(), uuid.New()
+	past := time.Now().Add(-time.Second)
+	for i := 0; i < 50; i++ {
+		addJob(t, db, noisy, past)
+	}
+	for i := 0; i < 3; i++ {
+		addJob(t, db, quiet, past)
+		addJob(t, db, paused, past)
+	}
+	if err := db.SetMaxRunning(ctx, noisy, 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPaused(ctx, paused, true); err != nil {
+		t.Fatal(err)
+	}
+	ownAllShards(t, db, "node-a")
+	claimed, _, throttled, err := db.Claim(ctx, "node-a", 100, 20, runNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := map[uuid.UUID]int{}
+	for _, run := range claimed {
+		count[run.TenantID]++
+	}
+	if count[noisy] != 5 || count[quiet] != 3 || count[paused] != 0 {
+		t.Fatalf("want noisy capped at 5, quiet 3, paused 0; got %v", count)
+	}
+	// 20 candidates for noisy (perTenant), 5 slots, so 15 throttled.
+	if throttled != 15 {
+		t.Fatalf("want 15 runs held back by noisy's cap, got %d", throttled)
+	}
+	stats, err := db.Stats(ctx)
+	if err != nil || stats.Paused != 3 {
+		t.Fatalf("want 3 due runs held by the pause, got %d (%v)", stats.Paused, err)
+	}
+}
+
 // If the next occurrence weren't written in the claim tx, a crash right after
 // claiming would end the schedule for good.
 func TestClaimStoresNextOccurrence(t *testing.T) {

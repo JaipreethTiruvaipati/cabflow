@@ -106,6 +106,18 @@ func (s *Store) Trigger(ctx context.Context, tenantID, jobID uuid.UUID, clientKe
 	return run, tx.Commit(ctx)
 }
 
+func (s *Store) SetPaused(ctx context.Context, tenantID uuid.UUID, paused bool) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO tenants (id, paused) VALUES ($1, $2)
+		ON CONFLICT (id) DO UPDATE SET paused = EXCLUDED.paused`, tenantID, paused)
+	return err
+}
+
+func (s *Store) SetMaxRunning(ctx context.Context, tenantID uuid.UUID, limit int) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO tenants (id, max_running) VALUES ($1, $2)
+		ON CONFLICT (id) DO UPDATE SET max_running = EXCLUDED.max_running`, tenantID, limit)
+	return err
+}
+
 type scanner interface{ Scan(dest ...any) error }
 
 func scanJob(row scanner) (domain.Job, error) {

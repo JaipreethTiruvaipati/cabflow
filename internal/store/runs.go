@@ -206,3 +206,16 @@ type Outcome struct {
 // Stats feeds the /metrics gauges. Counts are cluster-wide.
 type Stats struct{ Due, Running, Retrying, Dead, Paused int64 }
 
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	var stats Stats
+	err := s.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM runs WHERE status IN ('PENDING', 'RETRYING') AND next_attempt_at <= clock_timestamp()),
+		(SELECT count(*) FROM runs WHERE status = 'RUNNING'),
+		(SELECT count(*) FROM runs WHERE status = 'RETRYING'),
+		(SELECT count(*) FROM runs WHERE status = 'DEAD'),
+		(SELECT count(*) FROM runs r JOIN tenants t ON t.id = r.tenant_id WHERE t.paused
+			AND r.status IN ('PENDING', 'RETRYING') AND r.next_attempt_at <= clock_timestamp())`).Scan(
+		&stats.Due, &stats.Running, &stats.Retrying, &stats.Dead, &stats.Paused)
+	return stats, err
+}
+
