@@ -3,6 +3,8 @@ package schedule
 import (
 	"testing"
 	"time"
+
+	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 )
 
 func zone(t *testing.T, name string) *time.Location {
@@ -69,6 +71,46 @@ func TestCronRunsOnTenantWallClock(t *testing.T) {
 	}
 }
 
+func TestMisfirePolicies(t *testing.T) {
+	c := NewCalculator()
+	scheduled := time.Date(2026, 1, 1, 8, 0, 0, 0, time.UTC)
+	late := scheduled.Add(45 * time.Minute) // missed 08:00 through 08:40
+	job := func(policy domain.MisfirePolicy) domain.Job {
+		return domain.Job{Cron: "*/10 * * * *", Timezone: "UTC", MisfirePolicy: policy}
+	}
+	cases := []struct {
+		name     string
+		policy   domain.MisfirePolicy
+		now      time.Time
+		wantRun  bool
+		wantNext time.Time
+	}{
+		{"on time", domain.Skip, scheduled.Add(2 * time.Second), true, scheduled.Add(10 * time.Minute)},
+		{"fire now replays each missed run", domain.FireNow, late, true, scheduled.Add(10 * time.Minute)},
+		{"coalesce runs once then jumps ahead", domain.Coalesce, late, true, scheduled.Add(50 * time.Minute)},
+		{"skip drops the run and jumps ahead", domain.Skip, late, false, scheduled.Add(50 * time.Minute)},
+	}
+	for _, tc := range cases {
+		got, err := Decide(job(tc.policy), scheduled, tc.now, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Run != tc.wantRun || !got.Next.Equal(tc.wantNext) {
+			t.Errorf("%s: got run=%v next=%s, want run=%v next=%s", tc.name, got.Run, got.Next, tc.wantRun, tc.wantNext)
+		}
+	}
+}
+
+func TestOneOffJobHasNoNextRun(t *testing.T) {
+	got, err := Decide(domain.Job{Timezone: "UTC", MisfirePolicy: domain.Skip}, time.Unix(0, 0), time.Unix(3600, 0), NewCalculator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Run || !got.Next.IsZero() {
+		t.Fatalf("late one-off SKIP job: want no run and no next, got %+v", got)
+	}
+}
+
 func BenchmarkNext(b *testing.B) {
 	c := NewCalculator()
 	after := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -78,4 +120,3 @@ func BenchmarkNext(b *testing.B) {
 		}
 	}
 }
-
