@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"time"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
 	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 )
 
@@ -118,6 +120,29 @@ func (s *Store) SetMaxRunning(ctx context.Context, tenantID uuid.UUID, limit int
 	return err
 }
 
+func (s *Store) DeadLetters(ctx context.Context, tenantID uuid.UUID, limit int) ([]domain.Run, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+runColumns+` FROM runs WHERE tenant_id = $1 AND status = 'DEAD'
+		ORDER BY finished_at DESC LIMIT $2`, tenantID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.Run, error) { return scanRun(row) })
+}
+
+// Replay resets the attempt count but keeps the idempotency key, so replaying
+// can't send the same alert twice.
+func (s *Store) Replay(ctx context.Context, tenantID, runID uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE runs SET status = 'PENDING', attempt = 0, next_attempt_at = clock_timestamp(),
+		finished_at = NULL, last_error = NULL WHERE id = $1 AND tenant_id = $2 AND status = 'DEAD'`, runID, tenantID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
 type scanner interface{ Scan(dest ...any) error }
 
 func scanJob(row scanner) (domain.Job, error) {
@@ -133,4 +158,3 @@ func scanRun(row scanner) (domain.Run, error) {
 		&run.Attempt, &run.NextAttemptAt, &run.StartedAt, &run.FinishedAt, &run.LastError)
 	return run, notFound(err)
 }
-

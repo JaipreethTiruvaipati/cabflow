@@ -7,7 +7,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
 	"github.com/google/uuid"
+
 	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/store"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/testdb"
@@ -69,6 +71,33 @@ func TestConcurrentLeaseAcquisitionIsExclusive(t *testing.T) {
 	}
 }
 
+// The SIGSTOP case: node-a's lease runs out, node-b takes over, then node-a
+// tries to commit.
+func TestStaleOwnerCannotCommit(t *testing.T) {
+	url := testdb.New(t)
+	db := store.New(testdb.Pool(t, url, nil))
+	addJob(t, db, uuid.New(), time.Now().Add(-time.Second))
+	ownAllShards(t, db, "node-a")
+	claimed, _, _, err := db.Claim(ctx, "node-a", 10, 10, runNow)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: %v, %d runs", err, len(claimed))
+	}
+
+	// Pretend node-a froze long enough for its leases to run out.
+	if _, err := testdb.Pool(t, url, nil).Exec(ctx, `UPDATE shard_leases SET expires_at = clock_timestamp() - interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	ownAllShards(t, db, "node-b")
+
+	err = db.Finish(ctx, "node-a", claimed[0], store.Outcome{Status: domain.RunSucceeded})
+	if !errors.Is(err, domain.ErrStaleLease) {
+		t.Fatalf("stale owner's write: want ErrStaleLease, got %v", err)
+	}
+	if recovered, err := db.Recover(ctx, "node-b", 5); err != nil || recovered != 1 {
+		t.Fatalf("new owner should recover the run: %v, %d", err, recovered)
+	}
+}
+
 func TestClaimIsFairAndRespectsCapAndPause(t *testing.T) {
 	url := testdb.New(t)
 	db := store.New(testdb.Pool(t, url, nil))
@@ -127,6 +156,32 @@ func TestClaimStoresNextOccurrence(t *testing.T) {
 	}
 }
 
+func TestDeadLetterAndReplay(t *testing.T) {
+	url := testdb.New(t)
+	db := store.New(testdb.Pool(t, url, nil))
+	tenant := uuid.New()
+	addJob(t, db, tenant, time.Now().Add(-time.Second))
+	ownAllShards(t, db, "node-a")
+	claimed, _, _, _ := db.Claim(ctx, "node-a", 10, 10, runNow)
+	if err := db.Finish(ctx, "node-a", claimed[0], store.Outcome{Status: domain.RunDead, Error: "HANDLER_ERROR"}); err != nil {
+		t.Fatal(err)
+	}
+	dead, err := db.DeadLetters(ctx, tenant, 10)
+	if err != nil || len(dead) != 1 || dead[0].LastError != "HANDLER_ERROR" {
+		t.Fatalf("dead letters: %v %+v", err, dead)
+	}
+	if err := db.Replay(ctx, tenant, dead[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	again, _, _, _ := db.Claim(ctx, "node-a", 10, 10, runNow)
+	if len(again) != 1 || again[0].IdempotencyKey != claimed[0].IdempotencyKey || again[0].Attempt != 1 {
+		t.Fatalf("replay should requeue the same occurrence with a fresh budget, got %+v", again)
+	}
+	if err := db.Replay(ctx, uuid.New(), dead[0].ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("another tenant must not replay this run, got %v", err)
+	}
+}
+
 func TestManualTriggerIsIdempotent(t *testing.T) {
 	url := testdb.New(t)
 	db := store.New(testdb.Pool(t, url, nil))
@@ -144,4 +199,3 @@ func TestManualTriggerIsIdempotent(t *testing.T) {
 		t.Fatalf("another tenant must not trigger this job, got %v", err)
 	}
 }
-

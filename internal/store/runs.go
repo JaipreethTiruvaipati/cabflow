@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"time"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
 	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 )
 
@@ -203,6 +205,41 @@ type Outcome struct {
 	Error   string
 }
 
+// Finish is the fenced write. If our lease expired or the shard moved to a
+// newer epoch, nothing is written and we get ErrStaleLease. That's what stops
+// a node waking up from a long GC pause from overwriting someone else's work.
+func (s *Store) Finish(ctx context.Context, node string, run ClaimedRun, outcome Outcome) error {
+	tag, err := s.pool.Exec(ctx, `WITH lease AS (
+			SELECT 1 FROM shard_leases WHERE shard = $1 AND owner = $2 AND epoch = $3 AND expires_at > clock_timestamp() FOR SHARE)
+		UPDATE runs SET status = $5::text, owner = NULL, fence = NULL, lease_until = NULL,
+			finished_at = CASE WHEN $5::text IN ('SUCCEEDED', 'DEAD') THEN clock_timestamp() END,
+			next_attempt_at = CASE WHEN $5::text = 'RETRYING' THEN clock_timestamp() + make_interval(secs => $6) ELSE next_attempt_at END,
+			last_error = NULLIF($7, '')
+		WHERE id = $4 AND status = 'RUNNING' AND owner = $2 AND fence = $3 AND attempt = $8 AND EXISTS (SELECT 1 FROM lease)`,
+		run.Job.Shard, node, run.Fence, run.ID, string(outcome.Status), outcome.RetryIn.Seconds(), outcome.Error, run.Attempt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrStaleLease
+	}
+	return nil
+}
+
+// Recover picks up runs orphaned on our shards: claimed under an older epoch,
+// or stuck past max runtime plus a few seconds.
+func (s *Store) Recover(ctx context.Context, node string, maxAttempts int) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE runs r SET
+			status = CASE WHEN r.attempt >= $2 THEN 'DEAD' ELSE 'RETRYING' END,
+			finished_at = CASE WHEN r.attempt >= $2 THEN clock_timestamp() END,
+			next_attempt_at = clock_timestamp() + interval '1 second',
+			last_error = 'LEASE_LOST', owner = NULL, fence = NULL, lease_until = NULL
+		FROM shard_leases l
+		WHERE l.owner = $1 AND l.expires_at > clock_timestamp() AND r.shard = l.shard AND r.status = 'RUNNING'
+			AND (r.fence < l.epoch OR r.lease_until < clock_timestamp())`, node, maxAttempts)
+	return tag.RowsAffected(), err
+}
+
 // Stats feeds the /metrics gauges. Counts are cluster-wide.
 type Stats struct{ Due, Running, Retrying, Dead, Paused int64 }
 
@@ -218,4 +255,3 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 		&stats.Due, &stats.Running, &stats.Retrying, &stats.Dead, &stats.Paused)
 	return stats, err
 }
-
