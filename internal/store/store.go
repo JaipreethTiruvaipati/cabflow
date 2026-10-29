@@ -6,8 +6,11 @@ import (
 	"context"
 	_ "embed"
 	"errors"
+	"time"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 )
 
@@ -50,10 +53,18 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return tx.Commit(ctx)
 }
 
+// Now returns the database clock, not the node's.
+func (s *Store) Now(ctx context.Context) (time.Time, error) {
+	var now time.Time
+	err := s.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now)
+	return now.UTC(), err
+}
+
+func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+
 func notFound(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrNotFound
 	}
 	return err
 }
-
