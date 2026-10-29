@@ -6,10 +6,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"runtime/debug"
+	"slices"
+	"sort"
 	"sync"
 	"time"
+
 	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/metrics"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/notify"
@@ -85,6 +89,120 @@ func (n *Node) Handle(jobType string, h Handler) { n.handlers[jobType] = h }
 
 // KnownType lets the API reject job types we have no handler for.
 func (n *Node) KnownType(jobType string) bool { _, ok := n.handlers[jobType]; return ok }
+
+// Run blocks until ctx is done. On the way out it waits for in-flight runs and
+// gives its shards back, so nobody has to sit out the lease timeout.
+func (n *Node) Run(ctx context.Context) {
+	n.maintainLeases(ctx)
+	poll := time.NewTicker(n.cfg.PollInterval)
+	renew := time.NewTicker(n.cfg.LeaseTTL / 5)
+	defer poll.Stop()
+	defer renew.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			n.shutdown()
+			return
+		case <-renew.C:
+			n.maintainLeases(ctx)
+		case <-poll.C:
+			n.claimAndRun(ctx)
+		}
+	}
+}
+
+// maintainLeases is the membership logic. Every node aims for
+// ceil(64 / live nodes) shards. A new node picks up free ones while the others
+// drop their extras, and if a node dies its leases simply time out and get
+// taken.
+func (n *Node) maintainLeases(ctx context.Context) {
+	if err := n.db.Heartbeat(ctx, n.cfg.NodeID); err != nil {
+		n.fail("heartbeat", err)
+		return
+	}
+	owned, err := n.db.RenewLeases(ctx, n.cfg.NodeID, n.cfg.LeaseTTL)
+	if err != nil {
+		n.fail("renew leases", err)
+		return
+	}
+	live, err := n.db.LiveNodes(ctx, n.cfg.LeaseTTL)
+	if err != nil {
+		n.fail("count nodes", err)
+		return
+	}
+	live = max(live, 1) // guard against dividing by zero
+	share := (domain.ShardCount + live - 1) / live
+	switch {
+	case len(owned) > share:
+		extra := n.surplus(owned, len(owned)-share)
+		if err := n.db.ReleaseLeases(ctx, n.cfg.NodeID, extra); err != nil {
+			n.fail("release leases", err)
+		}
+		for _, shard := range extra {
+			delete(owned, shard)
+		}
+	case len(owned) < share:
+		gained, err := n.db.AcquireLeases(ctx, n.cfg.NodeID, share-len(owned), n.cfg.LeaseTTL)
+		if err != nil {
+			n.fail("acquire leases", err)
+		}
+		for shard, epoch := range gained {
+			owned[shard] = epoch
+		}
+	}
+	n.mu.Lock()
+	n.leases = owned
+	n.mu.Unlock()
+	n.metrics.OwnedShards.Store(int64(len(owned)))
+
+	recovered, err := n.db.Recover(ctx, n.cfg.NodeID, n.cfg.MaxAttempts)
+	if err != nil {
+		n.fail("recover runs", err)
+	} else if recovered > 0 {
+		n.metrics.Recovered.Add(recovered)
+		n.log.Warn("recovered runs from a lost owner", "count", recovered)
+	}
+}
+
+// surplus picks which shards to give away. Idle ones first, so less work gets
+// redone by whoever takes them.
+func (n *Node) surplus(owned store.Leases, count int) []int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	shards := slices.Collect(maps.Keys(owned))
+	sort.Slice(shards, func(i, j int) bool { return n.busy[shards[i]] < n.busy[shards[j]] })
+	return shards[:count]
+}
+
+func (n *Node) claimAndRun(ctx context.Context) {
+	free := cap(n.slots) - len(n.slots)
+	if free == 0 {
+		return
+	}
+	runs, skipped, throttled, err := n.db.Claim(ctx, n.cfg.NodeID, free, n.cfg.PerTenant, n.plan)
+	if err != nil {
+		n.fail("claim runs", err)
+		return
+	}
+	n.metrics.Skipped.Add(int64(skipped))
+	n.metrics.Throttled.Add(int64(throttled))
+	for _, run := range runs {
+		n.metrics.Claimed.Add(1)
+		n.slots <- struct{}{}
+		n.mu.Lock()
+		n.busy[run.Job.Shard]++
+		n.mu.Unlock()
+		n.inflight.Add(1)
+		go n.execute(run)
+	}
+}
+
+// plan runs inside the claim transaction. ClaimedAt comes from the DB clock,
+// which is the one we trust for "is this late".
+func (n *Node) plan(run store.ClaimedRun) (bool, time.Time, error) {
+	decision, err := schedule.Decide(run.Job, run.ScheduledAt, run.ClaimedAt, n.calc)
+	return decision.Run, decision.Next, err
+}
 
 func (n *Node) execute(run store.ClaimedRun) {
 	defer func() {
@@ -167,10 +285,27 @@ func errorCode(err error) string {
 	return "HANDLER_ERROR"
 }
 
+func (n *Node) shutdown() {
+	done := make(chan struct{})
+	go func() { n.inflight.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		n.log.Warn("shutdown: some runs still in flight; they will be recovered by another node")
+	}
+	n.mu.Lock()
+	shards := slices.Collect(maps.Keys(n.leases))
+	n.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := n.db.ReleaseLeases(ctx, n.cfg.NodeID, shards); err != nil {
+		n.fail("release leases on shutdown", err)
+	}
+}
+
 // fail bumps the per-operation error counter and logs a scrubbed version of
 // the error (see safelog).
 func (n *Node) fail(op string, err error) {
 	n.metrics.Error(op)
 	n.log.Error(op+" failed", "error", safelog.Error(err))
 }
-

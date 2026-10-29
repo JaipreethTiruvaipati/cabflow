@@ -1,0 +1,210 @@
+package scheduler_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
+	"github.com/JaipreethTiruvaipati/cabflow/internal/metrics"
+	"github.com/JaipreethTiruvaipati/cabflow/internal/notify"
+	"github.com/JaipreethTiruvaipati/cabflow/internal/scheduler"
+	"github.com/JaipreethTiruvaipati/cabflow/internal/store"
+	"github.com/JaipreethTiruvaipati/cabflow/internal/testdb"
+)
+
+const leaseTTL = time.Second
+
+// receiver is a fake idempotent notification service shared by the nodes.
+// It counts every key and remembers the order of first deliveries.
+type receiver struct {
+	mu    sync.Mutex
+	seen  map[string]int
+	order []uuid.UUID // tenant of each first delivery
+}
+
+func newReceiver() *receiver { return &receiver{seen: map[string]int{}} }
+
+func (r *receiver) Send(_ context.Context, n notify.Notification) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen[n.Key]++
+	if r.seen[n.Key] == 1 {
+		r.order = append(r.order, n.TenantID)
+	}
+	return nil
+}
+
+func (r *receiver) delivered() (unique, repeats int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, n := range r.seen {
+		repeats += n - 1
+	}
+	return len(r.seen), repeats
+}
+
+// gatedSender blocks while its node is frozen, like a stopped process would.
+// With freezeAfter set, the node freezes itself partway through a send, so it
+// still owns unfinished runs when it goes dark.
+type gatedSender struct {
+	inner       notify.Sender
+	gate        *testdb.Gate
+	freezeAfter *atomic.Int64
+	frozenAt    *atomic.Int64
+}
+
+func (s gatedSender) Send(ctx context.Context, n notify.Notification) error {
+	if s.freezeAfter.Add(-1) == 0 {
+		s.frozenAt.Store(time.Now().UnixNano())
+		s.gate.Freeze()
+	}
+	for s.gate.Frozen() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return s.inner.Send(ctx, n)
+}
+
+type testNode struct {
+	node        *scheduler.Node
+	metrics     *metrics.Metrics
+	gate        *testdb.Gate
+	freezeAfter *atomic.Int64 // arm with Store(n) to freeze on the n-th send
+	frozenAt    *atomic.Int64
+}
+
+func startNode(t *testing.T, ctx context.Context, dbURL, id string, sender notify.Sender, tweak func(*scheduler.Config), handlers map[string]scheduler.Handler) testNode {
+	t.Helper()
+	gate := &testdb.Gate{}
+	cfg := scheduler.DefaultConfig(id)
+	cfg.LeaseTTL, cfg.PollInterval, cfg.RetryBase, cfg.RetryMax = leaseTTL, 50*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	m := &metrics.Metrics{}
+	freezeAfter, frozenAt := &atomic.Int64{}, &atomic.Int64{}
+	freezeAfter.Store(-1)
+	node := scheduler.New(cfg, store.New(testdb.Pool(t, dbURL, gate)), gatedSender{sender, gate, freezeAfter, frozenAt}, m, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for jobType, handler := range handlers {
+		node.Handle(jobType, handler)
+	}
+	go node.Run(ctx)
+	t.Cleanup(gate.Resume) // let a "killed" node unwind so its pool can close
+	return testNode{node, m, gate, freezeAfter, frozenAt}
+}
+
+func seedAlerts(t *testing.T, db *store.Store, tenant uuid.UUID, count int, maxRuntimeMS int) {
+	t.Helper()
+	at := time.Now().UTC()
+	for i := 0; i < count; i++ {
+		id := uuid.New()
+		payload, _ := json.Marshal(map[string]string{"employee": fmt.Sprintf("emp-%04d", i), "message": "your cab is assigned"})
+		job := domain.Job{ID: id, TenantID: tenant, Type: "alert", Payload: payload, Timezone: "UTC",
+			MisfirePolicy: domain.Coalesce, MaxRuntimeMS: maxRuntimeMS, Shard: domain.ShardFor(id)}
+		if err := db.CreateJob(context.Background(), job, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, what string, ok func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if ok() {
+			return
+		}
+	}
+	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}
+
+// One read-only pool per test DB. Opening a fresh pool on every poll leaked
+// connections and made the kill test flaky.
+var checkPools sync.Map
+
+func succeededRuns(t *testing.T, dbURL string) int {
+	t.Helper()
+	pool, ok := checkPools.Load(dbURL)
+	if !ok {
+		pool, _ = checkPools.LoadOrStore(dbURL, testdb.Pool(t, dbURL, nil))
+	}
+	var n int
+	if err := pool.(*pgxpool.Pool).QueryRow(context.Background(), `SELECT count(*) FROM runs WHERE status = 'SUCCEEDED'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func startCluster(t *testing.T, ctx context.Context, dbURL string, rx notify.Sender, size int) []testNode {
+	t.Helper()
+	nodes := make([]testNode, size)
+	for i := range nodes {
+		nodes[i] = startNode(t, ctx, dbURL, fmt.Sprintf("node-%d", i), rx, nil, nil)
+	}
+	waitFor(t, 10*time.Second, "shards to spread across nodes", func() bool {
+		total := 0
+		for _, n := range nodes {
+			owned := int(n.metrics.OwnedShards.Load())
+			if owned < domain.ShardCount/size-1 {
+				return false
+			}
+			total += owned
+		}
+		return total == domain.ShardCount
+	})
+	return nodes
+}
+
+// Happy path: three nodes, 1,200 alerts, not a single repeat.
+func TestThreeNodesDeliverEachAlertOnce(t *testing.T) {
+	dbURL := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rx := newReceiver()
+	startCluster(t, ctx, dbURL, rx, 3)
+	seedAlerts(t, store.New(testdb.Pool(t, dbURL, nil)), uuid.New(), 1200, 5000)
+	waitFor(t, 30*time.Second, "1,200 alerts", func() bool { u, _ := rx.delivered(); return u == 1200 })
+	waitFor(t, 5*time.Second, "all runs recorded", func() bool { return succeededRuns(t, dbURL) == 1200 })
+	if _, repeats := rx.delivered(); repeats != 0 {
+		t.Fatalf("healthy cluster re-sent %d alerts", repeats)
+	}
+}
+
+// The 50k vs 20 case, scaled down: a noisy tenant shouldn't hold up a quiet one.
+func TestNoisyTenantDoesNotDelayQuietTenant(t *testing.T) {
+	dbURL := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := store.New(testdb.Pool(t, dbURL, nil))
+	noisy, quiet := uuid.New(), uuid.New()
+	seedAlerts(t, db, noisy, 2000, 5000)
+	seedAlerts(t, db, quiet, 20, 5000)
+	if err := db.SetMaxRunning(ctx, noisy, 1000); err != nil {
+		t.Fatal(err)
+	}
+	rx := newReceiver()
+	startNode(t, ctx, dbURL, "node-0", rx, func(c *scheduler.Config) { c.Workers = 8 }, nil)
+	waitFor(t, 60*time.Second, "all 2,020 alerts", func() bool { u, _ := rx.delivered(); return u == 2020 })
+	rx.mu.Lock()
+	defer rx.mu.Unlock()
+	last := 0
+	for i, tenant := range rx.order {
+		if tenant == quiet {
+			last = i
+		}
+	}
+	if last >= 100 {
+		t.Fatalf("quiet tenant's last alert was #%d of 2,020; it should finish within the first 100", last+1)
+	}
+}
+
