@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
 	"github.com/google/uuid"
+
 	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/safelog"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/service"
@@ -44,6 +46,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/jobs", s.auth.require(s.createJob, manage...))
 	mux.HandleFunc("GET /v1/jobs/{id}", s.auth.require(s.getJob, read...))
 	mux.HandleFunc("GET /v1/jobs/{id}/runs", s.auth.require(s.listRuns, read...))
+	mux.HandleFunc("GET /v1/jobs/{id}/next-fire-times", s.auth.require(s.nextFireTimes, read...))
+	mux.HandleFunc("POST /v1/jobs/{id}/trigger", s.auth.require(s.trigger, manage...))
+	mux.HandleFunc("POST /v1/tenants/{id}/pause", s.auth.require(s.pause(true), manage...))
+	mux.HandleFunc("POST /v1/tenants/{id}/resume", s.auth.require(s.pause(false), manage...))
+	mux.HandleFunc("PUT /v1/tenants/{id}/max-running", s.auth.require(s.setMaxRunning, manage...))
+	mux.HandleFunc("GET /v1/dead-letters", s.auth.require(s.deadLetters, manage...))
+	mux.HandleFunc("POST /v1/dead-letters/{id}/replay", s.auth.require(s.replay, manage...))
 	return s.logRequests(mux)
 }
 
@@ -90,6 +99,80 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	runs, err := s.jobs.Runs(r.Context(), principalFrom(r).TenantID, id, queryInt(r, "limit"))
 	s.respond(w, http.StatusOK, runs, err)
+}
+
+func (s *Server) nextFireTimes(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	times, err := s.jobs.NextFireTimes(r.Context(), principalFrom(r).TenantID, id, queryInt(r, "limit"))
+	s.respond(w, http.StatusOK, map[string][]time.Time{"next_fire_times": times}, err)
+}
+
+// trigger runs a job right away. A client retrying with the same
+// Idempotency-Key gets the same run back.
+func (s *Server) trigger(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	run, err := s.jobs.Trigger(r.Context(), principalFrom(r).TenantID, id, r.Header.Get("Idempotency-Key"))
+	s.respond(w, http.StatusAccepted, run, err)
+}
+
+// Admins can pause their own tenant; operators can pause anyone.
+func (s *Server) pause(paused bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tenant, ok := s.tenantInPath(w, r)
+		if !ok {
+			return
+		}
+		err := s.jobs.Pause(r.Context(), tenant, paused)
+		s.respond(w, http.StatusOK, map[string]bool{"paused": paused}, err)
+	}
+}
+
+func (s *Server) setMaxRunning(w http.ResponseWriter, r *http.Request) {
+	tenant, ok := s.tenantInPath(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		MaxRunning int `json:"max_running"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	err := s.jobs.SetMaxRunning(r.Context(), tenant, body.MaxRunning)
+	s.respond(w, http.StatusOK, body, err)
+}
+
+func (s *Server) deadLetters(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.jobs.DeadLetters(r.Context(), principalFrom(r).TenantID, queryInt(r, "limit"))
+	s.respond(w, http.StatusOK, runs, err)
+}
+
+func (s *Server) replay(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	err := s.jobs.Replay(r.Context(), principalFrom(r).TenantID, id)
+	s.respond(w, http.StatusAccepted, map[string]string{"status": "requeued"}, err)
+}
+
+func (s *Server) tenantInPath(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	tenant, ok := pathID(w, r)
+	if !ok {
+		return uuid.Nil, false
+	}
+	p := principalFrom(r)
+	if tenant != p.TenantID && !p.Has(RoleOperator) {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return uuid.Nil, false
+	}
+	return tenant, true
 }
 
 // visibleTo strips the payload for employees. Payloads can carry other
@@ -178,4 +261,3 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		s.log.Info("http", "method", r.Method, "route", r.Pattern, "status", sw.status, "ms", time.Since(start).Milliseconds())
 	})
 }
-

@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
 	"github.com/google/uuid"
+
 	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/schedule"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/store"
@@ -110,6 +112,20 @@ func (s *Jobs) validate(job domain.Job, runAt *time.Time) error {
 	return s.calc.Validate(job.Cron, job.Timezone)
 }
 
+// NextFireTimes starts from the stored next run, not from now, so a pending
+// misfire still shows up first.
+func (s *Jobs) NextFireTimes(ctx context.Context, tenantID, jobID uuid.UUID, limit int) ([]time.Time, error) {
+	job, err := s.db.GetJob(ctx, tenantID, jobID)
+	if err != nil {
+		return nil, err
+	}
+	next, ok, err := s.db.NextScheduled(ctx, jobID)
+	if err != nil || !ok {
+		return []time.Time{}, err
+	}
+	return schedule.Upcoming(job, next, pageSize(limit, 10), s.calc)
+}
+
 func (s *Jobs) Get(ctx context.Context, tenantID, jobID uuid.UUID) (domain.Job, error) {
 	return s.db.GetJob(ctx, tenantID, jobID)
 }
@@ -122,6 +138,32 @@ func (s *Jobs) Runs(ctx context.Context, tenantID, jobID uuid.UUID, limit int) (
 	return s.db.ListRuns(ctx, tenantID, jobID, pageSize(limit, 20))
 }
 
+func (s *Jobs) Trigger(ctx context.Context, tenantID, jobID uuid.UUID, clientKey string) (domain.Run, error) {
+	if clientKey == "" {
+		clientKey = uuid.NewString()
+	}
+	return s.db.Trigger(ctx, tenantID, jobID, clientKey)
+}
+
+func (s *Jobs) Pause(ctx context.Context, tenantID uuid.UUID, paused bool) error {
+	return s.db.SetPaused(ctx, tenantID, paused)
+}
+
+func (s *Jobs) SetMaxRunning(ctx context.Context, tenantID uuid.UUID, limit int) error {
+	if limit < 1 || limit > 10_000 {
+		return domain.Invalid("max_running must be between 1 and 10000")
+	}
+	return s.db.SetMaxRunning(ctx, tenantID, limit)
+}
+
+func (s *Jobs) DeadLetters(ctx context.Context, tenantID uuid.UUID, limit int) ([]domain.Run, error) {
+	return s.db.DeadLetters(ctx, tenantID, pageSize(limit, 50))
+}
+
+func (s *Jobs) Replay(ctx context.Context, tenantID, runID uuid.UUID) error {
+	return s.db.Replay(ctx, tenantID, runID)
+}
+
 // pageSize falls back to def for a missing or silly ?limit=.
 func pageSize(requested, def int) int {
 	if requested < 1 || requested > 100 {
@@ -129,4 +171,3 @@ func pageSize(requested, def int) int {
 	}
 	return requested
 }
-
