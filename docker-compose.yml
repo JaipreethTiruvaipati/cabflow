@@ -1,0 +1,58 @@
+# One command: PostgreSQL, an idempotent notification receiver, and three
+# identical scheduler nodes (each also serves the API).
+x-node: &node
+  build: .
+  restart: on-failure
+  depends_on:
+    postgres:
+      condition: service_healthy
+    receiver:
+      condition: service_started
+
+x-node-env: &node-env
+  DATABASE_URL: postgres://tripora:tripora@postgres:5432/tripora?sslmode=disable
+  NOTIFY_URL: http://receiver:9000/notify
+  JWT_SECRET: local-development-secret
+
+services:
+  postgres:
+    image: postgres:18
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_USER: tripora
+      POSTGRES_PASSWORD: tripora
+      POSTGRES_DB: tripora
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tripora -d tripora"]
+      interval: 2s
+      retries: 30
+
+  receiver:
+    build: .
+    entrypoint: ["/app/receiver"]
+    environment:
+      DATABASE_URL: postgres://tripora:tripora@postgres:5432/tripora?sslmode=disable
+    ports: ["127.0.0.1:9000:9000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  node-1:
+    <<: *node
+    environment: { <<: *node-env, NODE_NAME: node-1 }
+    ports: ["8081:8080"]
+
+  node-2:
+    <<: *node
+    environment: { <<: *node-env, NODE_NAME: node-2 }
+    ports: ["8082:8080"]
+
+  node-3:
+    <<: *node
+    environment: { <<: *node-env, NODE_NAME: node-3 }
+    ports: ["8083:8080"]
+
+volumes:
+  pgdata:
