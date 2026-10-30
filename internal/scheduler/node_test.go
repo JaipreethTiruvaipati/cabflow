@@ -3,6 +3,7 @@ package scheduler_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,12 +11,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/JaipreethTiruvaipati/cabflow/internal/domain"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/metrics"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/notify"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/scheduler"
+	"github.com/JaipreethTiruvaipati/cabflow/internal/service"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/store"
 	"github.com/JaipreethTiruvaipati/cabflow/internal/testdb"
 )
@@ -180,6 +184,52 @@ func TestThreeNodesDeliverEachAlertOnce(t *testing.T) {
 	}
 }
 
+// The kill -9 case from the brief: a node dies while 1,200 alerts go out. The
+// others should pick up its shards within the lease time, one alert per person.
+func TestKilledNodeIsTakenOverAndEveryAlertArrivesOnce(t *testing.T) {
+	dbURL := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rx := newReceiver()
+	nodes := startCluster(t, ctx, dbURL, rx, 3)
+	victim := nodes[0]
+	victim.freezeAfter.Store(100) // killed mid-send and never resumed during the test
+	seedAlerts(t, store.New(testdb.Pool(t, dbURL, nil)), uuid.New(), 1200, 5000)
+
+	waitFor(t, 30*time.Second, "1,200 alerts after the kill", func() bool { u, _ := rx.delivered(); return u == 1200 })
+	waitFor(t, 10*time.Second, "all runs recorded", func() bool { return succeededRuns(t, dbURL) == 1200 })
+	if victim.frozenAt.Load() == 0 {
+		t.Fatal("the node was never killed")
+	}
+	if took := time.Since(time.Unix(0, victim.frozenAt.Load())); took > leaseTTL+14*time.Second { // lease expiry plus delivering the rest, on a loaded laptop
+		t.Fatalf("takeover took %s; want within the lease time plus a few polls", took)
+	}
+}
+
+// The SIGSTOP case: freeze a node past its lease and let the others finish.
+// When it wakes up, its late writes should bounce off the fencing check.
+func TestFrozenNodeIsFencedWhenItResumes(t *testing.T) {
+	dbURL := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rx := newReceiver()
+	nodes := startCluster(t, ctx, dbURL, rx, 3)
+	frozen := nodes[0]
+	frozen.freezeAfter.Store(100)
+	// Long max runtime so the frozen node's attempts are still alive when it
+	// wakes up. That's what a really stopped process looks like.
+	seedAlerts(t, store.New(testdb.Pool(t, dbURL, nil)), uuid.New(), 1200, 60_000)
+
+	waitFor(t, 30*time.Second, "others to finish the frozen node's work", func() bool { u, _ := rx.delivered(); return u == 1200 })
+	waitFor(t, 10*time.Second, "all runs recorded", func() bool { return succeededRuns(t, dbURL) == 1200 })
+	frozen.gate.Resume()
+	waitFor(t, 10*time.Second, "the resumed node's stale writes to be rejected", func() bool { return frozen.metrics.Stale.Load() > 0 })
+	time.Sleep(200 * time.Millisecond)
+	if unique, _ := rx.delivered(); unique != 1200 || succeededRuns(t, dbURL) != 1200 {
+		t.Fatalf("want 1,200 alerts and 1,200 runs, got %d alerts and %d runs", unique, succeededRuns(t, dbURL))
+	}
+}
+
 // The 50k vs 20 case, scaled down: a noisy tenant shouldn't hold up a quiet one.
 func TestNoisyTenantDoesNotDelayQuietTenant(t *testing.T) {
 	dbURL := testdb.New(t)
@@ -208,3 +258,87 @@ func TestNoisyTenantDoesNotDelayQuietTenant(t *testing.T) {
 	}
 }
 
+func TestFailingRunRetriesThenDeadLettersThenReplays(t *testing.T) {
+	dbURL := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := store.New(testdb.Pool(t, dbURL, nil))
+	tenant := uuid.New()
+	seedAlerts(t, db, tenant, 1, 5000)
+	var attempts atomic.Int64
+	var healthy atomic.Bool
+	startNode(t, ctx, dbURL, "node-0", newReceiver(), func(c *scheduler.Config) { c.MaxAttempts = 3 }, map[string]scheduler.Handler{
+		"alert": func(context.Context, store.ClaimedRun) error {
+			attempts.Add(1)
+			if !healthy.Load() {
+				return errors.New("downstream rejected the alert")
+			}
+			return nil
+		},
+	})
+	var dead []domain.Run
+	waitFor(t, 10*time.Second, "dead letter", func() bool { dead, _ = db.DeadLetters(ctx, tenant, 10); return len(dead) == 1 })
+	if attempts.Load() != 3 || dead[0].LastError != "HANDLER_ERROR" {
+		t.Fatalf("want 3 attempts then a dead letter, got %d attempts, error %q", attempts.Load(), dead[0].LastError)
+	}
+	healthy.Store(true)
+	if err := db.Replay(ctx, tenant, dead[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "replayed run to succeed", func() bool { return succeededRuns(t, dbURL) == 1 })
+}
+
+func TestMaxRuntimeIsEnforced(t *testing.T) {
+	dbURL := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := store.New(testdb.Pool(t, dbURL, nil))
+	tenant := uuid.New()
+	seedAlerts(t, db, tenant, 1, 200)
+	startNode(t, ctx, dbURL, "node-0", newReceiver(), func(c *scheduler.Config) { c.MaxAttempts = 2 }, map[string]scheduler.Handler{
+		"alert": func(ctx context.Context, _ store.ClaimedRun) error {
+			<-ctx.Done() // a stuck downstream call
+			return ctx.Err()
+		},
+	})
+	waitFor(t, 10*time.Second, "timed-out run to be dead-lettered", func() bool {
+		dead, _ := db.DeadLetters(ctx, tenant, 10)
+		return len(dead) == 1 && dead[0].LastError == "TIMEOUT"
+	})
+}
+
+// After downtime SKIP drops the missed run and COALESCE runs it once. Either
+// way the schedule carries on from now.
+func TestMisfirePolicyAfterDowntime(t *testing.T) {
+	for _, policy := range []domain.MisfirePolicy{domain.Skip, domain.Coalesce} {
+		t.Run(string(policy), func(t *testing.T) {
+			dbURL := testdb.New(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			pool := testdb.Pool(t, dbURL, nil)
+			jobs := service.NewJobs(store.New(pool), nil)
+			job, err := jobs.Create(ctx, uuid.New(), service.CreateJob{Type: "alert", Payload: json.RawMessage(`{}`), Cron: "*/5 * * * *", MisfirePolicy: policy})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Pretend we were down: push the stored occurrence 20 minutes back.
+			missed := time.Now().Add(-20 * time.Minute).Truncate(5 * time.Minute).UTC()
+			if _, err := pool.Exec(ctx, `UPDATE runs SET scheduled_at = $1, next_attempt_at = $1, idempotency_key = $2`,
+				missed, domain.OccurrenceKey(job.ID, missed)); err != nil {
+				t.Fatal(err)
+			}
+			rx := newReceiver()
+			startNode(t, ctx, dbURL, "node-0", rx, nil, nil)
+			var times []time.Time
+			waitFor(t, 10*time.Second, "next occurrence after the misfire", func() bool {
+				times, _ = jobs.NextFireTimes(ctx, job.TenantID, job.ID, 1)
+				return len(times) == 1 && times[0].After(time.Now())
+			})
+			time.Sleep(200 * time.Millisecond)
+			unique, _ := rx.delivered()
+			if want := map[domain.MisfirePolicy]int{domain.Skip: 0, domain.Coalesce: 1}[policy]; unique != want {
+				t.Fatalf("%s: want %d alerts for the missed occurrence, got %d", policy, want, unique)
+			}
+		})
+	}
+}
