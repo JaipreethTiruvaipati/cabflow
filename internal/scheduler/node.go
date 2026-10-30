@@ -94,6 +94,7 @@ func (n *Node) KnownType(jobType string) bool { _, ok := n.handlers[jobType]; re
 // gives its shards back, so nobody has to sit out the lease timeout.
 func (n *Node) Run(ctx context.Context) {
 	n.maintainLeases(ctx)
+	n.inflight.Go(func() { n.prune(ctx) })
 	poll := time.NewTicker(n.cfg.PollInterval)
 	renew := time.NewTicker(n.cfg.LeaseTTL / 5)
 	defer poll.Stop()
@@ -218,7 +219,20 @@ func (n *Node) execute(run store.ClaimedRun) {
 	// Not tied to the node's ctx on purpose: during shutdown we'd rather let the
 	// run finish than burn the attempt.
 	ctx, cancel := context.WithTimeout(context.Background(), run.Job.MaxRuntime())
-	err := n.call(ctx, run)
+	done := make(chan error, 1)
+	go func() { done <- n.call(ctx, run) }()
+	timer := time.NewTimer(run.Job.MaxRuntime() + 2*time.Second)
+	defer timer.Stop()
+	var err error
+	select {
+	case err = <-done:
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+	case <-timer.C:
+		err = context.DeadlineExceeded
+		n.metrics.Abandoned.Add(1)
+	}
 	cancel()
 
 	outcome := n.outcome(run, err)
@@ -238,6 +252,32 @@ func (n *Node) execute(run store.ClaimedRun) {
 	default:
 		n.metrics.DeadLetters.Add(1)
 		n.log.Warn("run dead-lettered", "run_id", run.ID, "attempt", run.Attempt, "error", outcome.Error)
+	}
+}
+
+func (n *Node) prune(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for {
+				batchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				deleted, err := n.db.Prune(batchCtx, 7)
+				cancel()
+				if err != nil {
+					if ctx.Err() == nil {
+						n.fail("prune runs", err)
+					}
+					break
+				}
+				if deleted == 0 {
+					break
+				}
+			}
+		}
 	}
 }
 

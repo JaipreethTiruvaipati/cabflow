@@ -307,6 +307,54 @@ func TestMaxRuntimeIsEnforced(t *testing.T) {
 	})
 }
 
+func TestHandlerIgnoringDeadlineReleasesWorker(t *testing.T) {
+	dbURL := testdb.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := store.New(testdb.Pool(t, dbURL, nil))
+	tenant := uuid.New()
+	seedAlerts(t, db, tenant, 1, 20)
+	if err := db.SetMaxRunning(ctx, tenant, 1); err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.New()
+	job := domain.Job{ID: id, TenantID: tenant, Type: "noop", Payload: json.RawMessage(`{}`), Timezone: "UTC",
+		MisfirePolicy: domain.Coalesce, MaxRuntimeMS: 1000, Shard: domain.ShardFor(id)}
+	if err := db.CreateJob(ctx, job, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	returned := make(chan struct{}, 2)
+	defer func() { close(release) }()
+	node := startNode(t, ctx, dbURL, "node-0", newReceiver(), func(c *scheduler.Config) {
+		c.Workers, c.MaxAttempts = 1, 2
+	}, map[string]scheduler.Handler{
+		"alert": func(context.Context, store.ClaimedRun) error {
+			<-release
+			returned <- struct{}{}
+			return nil
+		},
+	})
+	waitFor(t, 8*time.Second, "timeouts to release the only worker and tenant slot", func() bool {
+		dead, err := db.DeadLetters(ctx, tenant, 10)
+		return err == nil && len(dead) == 1 && dead[0].Attempt == 2 && dead[0].LastError == "TIMEOUT" &&
+			succeededRuns(t, dbURL) == 1 && node.metrics.Abandoned.Load() == 2
+	})
+	release <- struct{}{}
+	release <- struct{}{}
+	for range 2 {
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatal("late handler did not return")
+		}
+	}
+	dead, err := db.DeadLetters(ctx, tenant, 10)
+	if err != nil || len(dead) != 1 || dead[0].LastError != "TIMEOUT" {
+		t.Fatalf("late success overwrote timeout: %+v (%v)", dead, err)
+	}
+}
+
 // After downtime SKIP drops the missed run and COALESCE runs it once. Either
 // way the schedule carries on from now.
 func TestMisfirePolicyAfterDowntime(t *testing.T) {

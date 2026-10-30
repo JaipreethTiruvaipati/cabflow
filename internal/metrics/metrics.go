@@ -31,6 +31,7 @@ type Metrics struct {
 	Throttled   atomic.Int64 // due runs held back by their tenant's running cap
 	Stale       atomic.Int64 // writes rejected by the fencing check
 	Recovered   atomic.Int64 // runs taken back from a lost owner
+	Abandoned   atomic.Int64 // handlers still running after their timeout and grace period
 	HTTP5xx     atomic.Int64
 	OwnedShards atomic.Int64
 
@@ -109,6 +110,7 @@ func (m *Metrics) Handler(db *store.Store) http.Handler {
 			{"tripora_runs_throttled_total", m.Throttled.Load()},
 			{"tripora_stale_writes_rejected_total", m.Stale.Load()},
 			{"tripora_runs_recovered_total", m.Recovered.Load()},
+			{"tripora_handlers_abandoned_total", m.Abandoned.Load()},
 			{"tripora_http_5xx_total", m.HTTP5xx.Load()},
 		}
 		for _, c := range counters {

@@ -35,6 +35,7 @@ flowchart LR
 **Node loop** (`internal/scheduler/node.go`):
 - **Every 2 s:** heartbeat, renew leases, move toward an equal share `ceil(64 / live nodes)`, and recover runs from lost owners. A new node takes free shards, busy nodes release their surplus, and a dead node's leases expire so the survivors take them.
 - **Every 100 ms:** claim due runs (one transaction), run each in a worker pool of 64 with `context.WithTimeout(max_runtime)`, then finish it with one fenced `UPDATE`.
+- **Every 10 minutes:** a separate cleanup loop prunes successful/skipped runs older than 7 days, 5,000 at a time. A transaction advisory lock permits one batch at a time across nodes; lease renewal continues independently. Empty one-off jobs are removed, while active runs and dead letters stay. The receiver prunes delivery receipts on the same schedule. Deduplication expires with these records; replaying a dead letter after its receipt expires can deliver again.
 
 **No single hot lock.** Each claim locks only the node's own lease rows (shared lock) and the runs it takes. Nodes never queue on a common row.
 
@@ -83,7 +84,7 @@ sequenceDiagram
 | Node killed (kill -9) | Its in-flight alerts pause for up to one lease (10 s) | Lease expires; another node takes the shard (epoch+1), requeues the runs and re-sends with the same keys |
 | Node frozen (SIGSTOP, GC pause) | Same as a kill | When it resumes, its writes fail the fencing check. Postgres also kills its idle transactions after 5 s, so it cannot hold locks |
 | Notification service down | Alerts are late | Retries with backoff; dead letter after 5 attempts; operator replays |
-| Handler hangs | That run times out | `max_runtime` cancels it; counted as an attempt |
+| Handler hangs | That run times out | After `max_runtime` plus 2 s, stop waiting, release the worker and retry or dead-letter with `TIMEOUT`. The abandoned goroutine cannot finish the run; count it in `tripora_handlers_abandoned_total` |
 | PostgreSQL down | Nothing runs; `/readyz` returns 503 | Work is durable in the database and resumes when it is back |
 | One tenant floods the system | That tenant queues behind its cap | Other tenants keep their share of every claim |
 
@@ -95,7 +96,7 @@ sequenceDiagram
 
 ## Deliberately left out
 
-Multi-region, job update and delete, per-tenant metrics labels, retention of old runs (a nightly `DELETE` of finished runs older than N days would do), and payload encryption at rest.
+Multi-region, job update and delete, per-tenant metrics labels, and payload encryption at rest.
 
 ## Cost and limits
 
@@ -106,7 +107,7 @@ Multi-region, job update and delete, per-tenant metrics labels, retention of old
 | Next fire time | O(1) cron evaluation; zones and cron strings are cached (bounded at 10,000 entries; they never go stale) |
 | `/metrics` run counts | One database query per node per 5 s at most; the gauges are cached for 5 s, so they can be up to 5 s stale (bounded by the TTL) |
 | Rebalance | Bounded by 64 lease rows; happens only when nodes join or leave |
-| Node memory | O(workers) |
+| Node memory | O(workers + abandoned handlers); a handler that never returns retains its goroutine |
 
 **Measured.**
 - Claim path: about 1,110 runs/s per node (`BenchmarkClaim`).

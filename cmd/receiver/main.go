@@ -19,7 +19,8 @@ const schema = `CREATE TABLE IF NOT EXISTS deliveries (
 	idempotency_key TEXT PRIMARY KEY,
 	tenant_id       UUID NOT NULL,
 	received_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-	attempts        INTEGER NOT NULL DEFAULT 1)`
+	attempts        INTEGER NOT NULL DEFAULT 1);
+CREATE INDEX IF NOT EXISTS deliveries_received ON deliveries (received_at)`
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -37,6 +38,24 @@ func main() {
 		log.Error("database unavailable", "error", err)
 		os.Exit(1)
 	}
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			for {
+				batchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				deleted, err := pruneDeliveries(batchCtx, pool)
+				cancel()
+				if err != nil {
+					log.Error("prune deliveries", "error", err)
+					break
+				}
+				if deleted == 0 {
+					break
+				}
+			}
+		}
+	}()
 
 	// DELAY_MS slows deliveries down so chaos.sh can stop a node mid-send.
 	delay, _ := time.ParseDuration(os.Getenv("DELAY_MS") + "ms")
@@ -75,4 +94,14 @@ func main() {
 		log.Error("receiver stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func pruneDeliveries(ctx context.Context, pool *pgxpool.Pool) (int64, error) {
+	tag, err := pool.Exec(ctx, `WITH cleanup AS MATERIALIZED (
+		SELECT pg_try_advisory_xact_lock(4242, 2) AS acquired)
+		DELETE FROM deliveries WHERE idempotency_key IN (
+			SELECT idempotency_key FROM deliveries, cleanup
+			WHERE acquired AND received_at < statement_timestamp() - interval '7 days'
+			ORDER BY received_at LIMIT 5000 FOR UPDATE OF deliveries SKIP LOCKED)`)
+	return tag.RowsAffected(), err
 }

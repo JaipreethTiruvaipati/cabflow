@@ -8,6 +8,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -61,6 +62,41 @@ func (s *Store) Now(ctx context.Context) (time.Time, error) {
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
+
+// Prune removes at most 5,000 finished runs and their empty one-off jobs.
+// The transaction lock allows only one cleanup batch across the cluster.
+func (s *Store) Prune(ctx context.Context, days int) (int64, error) {
+	if days < 1 {
+		return 0, domain.Invalid("retention days must be positive")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	var locked bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(4242, 1)`).Scan(&locked); err != nil || !locked {
+		return 0, err
+	}
+	rows, err := tx.Query(ctx, `DELETE FROM runs WHERE id IN (
+		SELECT id FROM runs WHERE status IN ('SUCCEEDED', 'SKIPPED')
+			AND finished_at < statement_timestamp() - make_interval(days => $1)
+		ORDER BY finished_at LIMIT 5000 FOR UPDATE SKIP LOCKED) RETURNING job_id`, days)
+	if err != nil {
+		return 0, err
+	}
+	jobs, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return 0, err
+	}
+	if len(jobs) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM jobs j WHERE j.id = ANY($1) AND j.cron IS NULL
+			AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.job_id = j.id)`, jobs); err != nil {
+			return 0, err
+		}
+	}
+	return int64(len(jobs)), tx.Commit(ctx)
+}
 
 func notFound(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {

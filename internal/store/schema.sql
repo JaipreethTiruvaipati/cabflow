@@ -48,6 +48,7 @@ CREATE INDEX IF NOT EXISTS runs_due ON runs (shard, next_attempt_at) WHERE statu
 CREATE INDEX IF NOT EXISTS runs_running ON runs (shard, lease_until) WHERE status = 'RUNNING';
 CREATE INDEX IF NOT EXISTS runs_running_tenant ON runs (tenant_id) WHERE status = 'RUNNING';
 CREATE INDEX IF NOT EXISTS runs_dead ON runs (tenant_id, finished_at) WHERE status = 'DEAD';
+CREATE INDEX IF NOT EXISTS runs_finished ON runs (finished_at) WHERE status IN ('SUCCEEDED', 'SKIPPED');
 CREATE INDEX IF NOT EXISTS runs_job ON runs (job_id, scheduled_at);
 
 -- epoch goes up whenever a shard changes hands. Writes carry the epoch they

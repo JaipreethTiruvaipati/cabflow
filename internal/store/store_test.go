@@ -19,6 +19,91 @@ var ctx = context.Background()
 
 func runNow(store.ClaimedRun) (bool, time.Time, error) { return true, time.Time{}, nil }
 
+func TestPruneRetainsActiveRunsAndDeadLetters(t *testing.T) {
+	url := testdb.New(t)
+	pool := testdb.Pool(t, url, nil)
+	db := store.New(pool)
+	tenant := uuid.New()
+	for _, status := range []string{"SUCCEEDED", "SKIPPED", "PENDING", "RUNNING", "RETRYING", "DEAD", "SUCCEEDED"} {
+		job := addJob(t, db, tenant, time.Now())
+		age := "8 days"
+		if status == "SUCCEEDED" {
+			var count int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM runs WHERE status = 'SUCCEEDED'`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count > 0 {
+				age = "1 day"
+			}
+		}
+		if _, err := pool.Exec(ctx, `UPDATE runs SET status = $2, finished_at = statement_timestamp() - $3::interval WHERE job_id = $1`, job.ID, status, age); err != nil {
+			t.Fatal(err)
+		}
+	}
+	kept := addJob(t, db, tenant, time.Now())
+	if _, err := pool.Exec(ctx, `UPDATE runs SET status = 'SUCCEEDED', finished_at = statement_timestamp() - interval '8 days' WHERE job_id = $1`, kept.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Trigger(ctx, tenant, kept.ID, "pending"); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locked.Rollback(ctx)
+	if _, err := locked.Exec(ctx, `SELECT pg_advisory_xact_lock(4242, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := db.Prune(ctx, 7); err != nil || n != 0 {
+		t.Fatalf("another cleaner owns the lock: deleted %d (%v)", n, err)
+	}
+	if err := locked.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := db.Prune(ctx, 7); err != nil || n != 3 {
+		t.Fatalf("want 3 expired successful/skipped runs removed, got %d (%v)", n, err)
+	}
+	var runs, jobs int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM runs), (SELECT count(*) FROM jobs)`).Scan(&runs, &jobs); err != nil {
+		t.Fatal(err)
+	}
+	if runs != 6 || jobs != 6 {
+		t.Fatalf("active, dead and recent records must stay; got %d runs, %d jobs", runs, jobs)
+	}
+	if _, err := db.GetJob(ctx, tenant, kept.ID); err != nil {
+		t.Fatalf("one-off with pending manual run was removed: %v", err)
+	}
+	if n, err := db.Prune(ctx, 7); err != nil || n != 0 {
+		t.Fatalf("cleanup should now be empty: %d (%v)", n, err)
+	}
+}
+
+func TestPruneBatchesAndPreservesRecurringJob(t *testing.T) {
+	url := testdb.New(t)
+	pool := testdb.Pool(t, url, nil)
+	db := store.New(pool)
+	job := addJob(t, db, uuid.New(), time.Now())
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET cron = '* * * * *' WHERE id = $1`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO runs
+		(id, job_id, tenant_id, shard, priority, scheduled_at, idempotency_key, status, next_attempt_at, finished_at)
+		SELECT gen_random_uuid(), $1, $2, $3, 0, clock_timestamp(), 'expired-' || i, 'SUCCEEDED',
+			clock_timestamp(), statement_timestamp() - interval '8 days' FROM generate_series(1, 5001) i`,
+		job.ID, job.TenantID, job.Shard); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []int64{5000, 1, 0} {
+		if n, err := db.Prune(ctx, 7); err != nil || n != want {
+			t.Fatalf("want batch of %d, got %d (%v)", want, n, err)
+		}
+	}
+	if _, err := db.GetJob(ctx, job.TenantID, job.ID); err != nil {
+		t.Fatalf("recurring job was removed: %v", err)
+	}
+}
+
 func addJob(t *testing.T, db *store.Store, tenant uuid.UUID, at time.Time) domain.Job {
 	t.Helper()
 	id := uuid.New()

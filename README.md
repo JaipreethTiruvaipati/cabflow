@@ -69,6 +69,7 @@ curl -H "$H" -X POST localhost:8081/v1/dead-letters/<run-id>/replay
 | `tripora_runs_retried_total`, `tripora_runs_dead_lettered_total` | Retries and dead letters |
 | `tripora_runs_throttled_total` | Runs held back by a tenant's cap |
 | `tripora_stale_writes_rejected_total` | Writes rejected by the fencing check |
+| `tripora_handlers_abandoned_total` | Handlers still running after their deadline plus 2 s; their worker slots have been freed |
 | `tripora_errors_total{operation}` | Errors by operation |
 | `tripora_http_5xx_total` | Server errors on the API |
 
@@ -98,6 +99,8 @@ scripts/chaos.sh               # kill -9 and SIGSTOP against the real docker clu
 | Fairness and per-tenant cap | `TestNoisyTenantDoesNotDelayQuietTenant`, `TestClaimIsFairAndRespectsCapAndPause` |
 | Retries, dead letters, replay | `TestFailingRunRetriesThenDeadLettersThenReplays`, `TestDeadLetterAndReplay` |
 | Max run time | `TestMaxRuntimeIsEnforced` |
+| Handler ignores its deadline | `TestHandlerIgnoringDeadlineReleasesWorker` |
+| Retention, cleanup locking and batches | `TestPruneRetainsActiveRunsAndDeadLetters`, `TestPruneBatchesAndPreservesRecurringJob`, `TestPruneDeliveries` |
 | Misfire policies | `TestMisfirePolicies`, `TestMisfirePolicyAfterDowntime` |
 | DST gap and overlap | `TestSpringForwardSkipsMissingWallTime`, `TestFallBackRunsOnceAtFirstOccurrence` |
 | Recurring schedule survives crashes | `TestClaimStoresNextOccurrence` |
@@ -158,12 +161,13 @@ Result: about 1,110 runs/s per node.
 - **Consistency over availability.** All claims and commits go through one PostgreSQL primary and a fencing check. If the database is down, nothing runs, but nothing runs twice either.
 - **Latency vs load.** Polling every 100 ms gives sub-second lag with simple code, at the cost of steady idle queries.
 - **Re-sends instead of per-recipient tracking.** After a failover or rebalance a run is sent again under the same key and the receiver drops the repeat. That is simpler, with extra downstream calls only during failures.
-- **Left out:** multi-region, job update/delete, retention of old runs, payload encryption. See [docs/design.md](docs/design.md) for details.
+- **Retention:** every 10 minutes, cleanup removes `SUCCEEDED` and `SKIPPED` runs finished more than 7 days ago, in batches of 5,000 under an advisory lock. Empty one-off jobs are removed too; active runs and dead letters stay. The receiver applies the same retention to delivery receipts. Manual-trigger deduplication lasts until its finished run is pruned; after that, reusing the key on a retained job can create a new run. Receiver deduplication also expires after 7 days, so replaying an older dead letter may deliver again.
+- **Left out:** multi-region, job update/delete, payload encryption. See [docs/design.md](docs/design.md) for details.
 
 ## Assumptions
 
 - Downstream services honour `Idempotency-Key`. The bundled receiver does, and counts the repeats it ignored.
-- Handlers respect their context deadline (the built-in ones do).
+- Handlers should respect their context deadline. After the deadline plus 2 s, the worker stops waiting and records `TIMEOUT` for retry or dead lettering. Go cannot kill the abandoned goroutine; it retains memory until it returns. Late sends must use the same idempotency key, and a late return cannot update the run outcome.
 - One PostgreSQL primary is the source of truth; 64 shards are enough for the node counts we expect.
 
 ## Why Go
