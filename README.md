@@ -4,6 +4,12 @@ Tripora is the MoveInSync case study 3 solution. It runs timed jobs (rosters at 
 
 It is Go and PostgreSQL, nothing else. See [docs/design.md](docs/design.md) for the architecture, the freeze/fencing sequence, the failure-mode table and the trade-offs.
 
+## Demo
+
+[![Watch the 3:02 project demo](docs/demo-preview.png)](docs/demo.mp4)
+
+[Watch the demo (3:02)](docs/demo.mp4): job creation, idempotent manual triggers, tenant controls, role checks, and recovery after a node freezes.
+
 ## Run it
 
 ```bash
