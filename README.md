@@ -97,3 +97,99 @@ scripts/chaos.sh               # kill -9 and SIGSTOP against the real docker clu
 | Recurring schedule survives crashes | `TestClaimStoresNextOccurrence` |
 | Tenant isolation, roles, safe errors | `internal/api/api_test.go` |
 
+## Load test: 100,000 jobs in one 10-minute window, three nodes
+
+```bash
+docker compose up -d --build
+go run ./cmd/loadtest -jobs 100000 -window 10m   # half the jobs belong to one hot tenant
+```
+
+Measured on an Intel i5-10300H laptop (8 threads, 23 GB RAM, Fedora 44). PostgreSQL 18 and all three nodes ran in Docker on the same machine:
+
+| | |
+|---|---|
+| runs | 100,000 succeeded, 0 dead-lettered |
+| throughput | 166.7 runs/s (the offered rate; the cluster kept up for the whole window) |
+| fire lag, all tenants | p50 0.068 s, p95 0.196 s, **p99 0.573 s**, max 4.748 s |
+| fire lag, hot tenant (50% of jobs) | p50 0.068 s, p99 1.188 s |
+| fire lag, the other 49 tenants | p50 0.067 s, p99 0.346 s |
+| delivery lag (receiver) | p50 0.082 s, p99 1.576 s |
+| exactly once | 100,000 alerts delivered once each, 0 re-sends |
+
+Result: **PASS** (p99 fire lag under 2 s).
+
+**Burst fairness** (the PDF's "50,000 alerts at 8:00 AM must not delay another client's 20"):
+
+```bash
+go run ./cmd/loadtest -burst -jobs 50000 -quiet 20   # 50,000 + 20 alerts, all due at the same instant
+```
+
+| | |
+|---|---|
+| runs | 50,020 succeeded, 0 dead-lettered, each alert delivered exactly once |
+| quiet tenant (20 alerts) | p50 0.034 s, **p99 0.086 s**; its last alert was delivery **#80 of 50,020** |
+| hot tenant (50,000 alerts) | drained at 480 runs/s, capped at 100 running at a time; p50 56 s, p99 102 s |
+
+Result: **PASS**. The flood is queued behind its own cap, and the other tenant is served first.
+
+**Chaos runs** against the real docker cluster (`scripts/chaos.sh`, 1,200 alerts each):
+
+| Scenario | Result |
+|---|---|
+| `kill -9 node-1` while alerts fire | 1,200 of 1,200 delivered once each. Lag during takeover p99 10.4 s (the 10 s lease) |
+| `SIGSTOP node-2` for 30 s, then `SIGCONT` | 1,200 of 1,200 delivered once each. node-2's **5 stale writes rejected** by the fencing token; 5 re-sends ignored by the receiver |
+
+**Claim-path benchmark** (one node, database work only, no handler):
+
+```bash
+go test ./internal/store -run x -bench Claim -benchtime 3x
+```
+
+Result: about 1,110 runs/s per node.
+
+## Trade-offs (short)
+
+- **Consistency over availability.** All claims and commits go through one PostgreSQL primary and a fencing check. If the database is down, nothing runs, but nothing runs twice either.
+- **Latency vs load.** Polling every 100 ms gives sub-second lag with simple code, at the cost of steady idle queries.
+- **Re-sends instead of per-recipient tracking.** After a failover or rebalance a run is sent again under the same key and the receiver drops the repeat. That is simpler, with extra downstream calls only during failures.
+- **Left out:** multi-region, job update/delete, retention of old runs, payload encryption. See [docs/design.md](docs/design.md) for details.
+
+## Assumptions
+
+- Downstream services honour `Idempotency-Key`. The bundled receiver does, and counts the repeats it ignored.
+- Handlers respect their context deadline (the built-in ones do).
+- One PostgreSQL primary is the source of truth; 64 shards are enough for the node counts we expect.
+
+## Why Go
+
+The PDF prefers Java but allows Go if the choice is defended. This problem is mostly concurrency: leases, worker pools, timeouts, races between nodes. Go's goroutines, `context` deadlines and race detector make that code short and testable, and every test here runs under `-race`. Nodes are single static binaries that start in milliseconds, which matters when nodes come and go.
+
+The layering maps directly:
+
+| Layer | Package |
+|---|---|
+| controller | `internal/api` |
+| service | `internal/service` |
+| repository | `internal/store` |
+| node | `internal/scheduler` |
+
+The scheduling rules (`internal/schedule`: DST and misfire) are plain functions, tested without a database.
+
+## Layout
+
+```text
+cmd/tripora         node: API + scheduler
+cmd/receiver        idempotent notification receiver (for compose and chaos tests)
+cmd/loadtest        seeds jobs, measures fire lag, checks exactly-once
+cmd/token           issues local JWTs
+internal/domain     types, keys, shard placement, validation errors
+internal/schedule   cron on tenant time, DST, misfire policy
+internal/store      PostgreSQL: schema, leases, claim, fenced finish, recovery
+internal/scheduler  the node loop
+internal/service    use cases behind the API
+internal/api        HTTP, JWT auth, error mapping
+internal/metrics    Prometheus text metrics
+internal/notify     notification sender (HTTP with Idempotency-Key)
+internal/testdb     throwaway databases and node freeze/kill for tests
+scripts/chaos.sh    kill -9 and SIGSTOP scenarios against docker compose
+```
