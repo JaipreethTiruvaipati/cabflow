@@ -38,8 +38,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// DELAY_MS slows deliveries down so chaos.sh can stop a node mid-send.
+	delay, _ := time.ParseDuration(os.Getenv("DELAY_MS") + "ms")
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /notify", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(delay)
 		key, tenant := r.Header.Get("Idempotency-Key"), r.Header.Get("X-Tenant-ID")
 		body, _ := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 		if key == "" || !json.Valid(body) {
